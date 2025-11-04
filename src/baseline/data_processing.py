@@ -149,7 +149,10 @@ def expand_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
         for book_id in book_ids:
             expanded_rows.append({constants.COL_USER_ID: user_id, constants.COL_BOOK_ID: book_id})
 
-    expanded_df = pd.DataFrame(expanded_rows, dtype={constants.COL_USER_ID: "int32", constants.COL_BOOK_ID: "int32"})
+    expanded_df = pd.DataFrame(expanded_rows)
+    # Convert to proper dtypes
+    expanded_df[constants.COL_USER_ID] = expanded_df[constants.COL_USER_ID].astype("int32")
+    expanded_df[constants.COL_BOOK_ID] = expanded_df[constants.COL_BOOK_ID].astype("int32")
     print(f"Expanded candidates: {len(candidates_df):,} users -> {len(expanded_df):,} pairs")
     return expanded_df
 

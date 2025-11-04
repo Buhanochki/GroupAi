@@ -106,9 +106,14 @@ def predict() -> None:
         subset=[constants.COL_BOOK_ID]
     )
 
-    # Merge book features
+    # Merge book features - drop duplicate columns before merge
+    # Remove columns that will be merged from candidates_with_meta if they exist
+    cols_to_drop = [col for col in feature_cols if col in candidates_with_meta.columns]
+    if cols_to_drop:
+        candidates_with_meta = candidates_with_meta.drop(columns=cols_to_drop)
+
     candidates_with_meta = candidates_with_meta.merge(
-        book_features_df, on=constants.COL_BOOK_ID, how="left", suffixes=("", "_from_prep")
+        book_features_df, on=constants.COL_BOOK_ID, how="left"
     )
 
     # Get TF-IDF and BERT features from prepared data
@@ -132,7 +137,28 @@ def predict() -> None:
     print("Handling missing values...")
     candidates_final = handle_missing_values(candidates_with_agg, train_df)
 
-    # Define features (same as in train.py)
+    # Load feature list saved during training
+    import json
+    features_path = config.MODEL_DIR / "features_list.json"
+    if features_path.exists():
+        print("Loading feature list from training...")
+        with open(features_path, "r") as f:
+            features = json.load(f)
+        print(f"Loaded {len(features)} features from training")
+    else:
+        # Fallback: use same logic as training
+        print("Warning: Feature list not found, using fallback logic")
+        exclude_cols = [
+            constants.COL_SOURCE,
+            config.TARGET,
+            constants.COL_PREDICTION,
+            constants.COL_TIMESTAMP,
+        ]
+        train_features = [col for col in train_df.columns if col not in exclude_cols]
+        train_non_feature_object_cols = train_df[train_features].select_dtypes(include=["object"]).columns.tolist()
+        features = [f for f in train_features if f not in train_non_feature_object_cols]
+
+    # Remove any columns that shouldn't be features (like title, author_name, etc.)
     exclude_cols = [
         constants.COL_SOURCE,
         config.TARGET,
@@ -141,11 +167,74 @@ def predict() -> None:
         constants.COL_USER_ID,
         constants.COL_BOOK_ID,
     ]
-    features = [col for col in candidates_final.columns if col not in exclude_cols]
+    candidates_final = candidates_final.drop(
+        columns=[col for col in candidates_final.columns if col not in features and col not in exclude_cols + [constants.COL_USER_ID, constants.COL_BOOK_ID]],
+        errors="ignore"
+    )
 
-    # Exclude any remaining object columns that are not model features
-    non_feature_object_cols = candidates_final[features].select_dtypes(include=["object"]).columns.tolist()
-    features = [f for f in features if f not in non_feature_object_cols]
+    # Add missing features with default values
+    missing_features = [f for f in features if f not in candidates_final.columns]
+    if missing_features:
+        print(f"Warning: Missing {len(missing_features)} features in candidates, adding defaults")
+        for feat in missing_features:
+            if feat in train_df.columns:
+                if train_df[feat].dtype.name == "category":
+                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
+                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
+                else:
+                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
+            else:
+                candidates_final[feat] = 0
+
+    # Ensure all features exist in candidates_final (add missing ones)
+    # features list is from training, so we need all of them
+    for feat in features:
+        if feat not in candidates_final.columns:
+            # Add with default value
+            if feat in train_df.columns:
+                if train_df[feat].dtype.name == "category":
+                    default_val = train_df[feat].cat.categories[0] if len(train_df[feat].cat.categories) > 0 else 0
+                    candidates_final[feat] = pd.Categorical([default_val] * len(candidates_final), categories=train_df[feat].cat.categories, ordered=False)
+                else:
+                    candidates_final[feat] = train_df[feat].iloc[0] if len(train_df) > 0 else 0
+            else:
+                candidates_final[feat] = 0
+
+    # Final check: ensure we have all features in the exact order
+    features = [f for f in features if f in candidates_final.columns]
+
+    # Convert categorical columns to pandas 'category' dtype for LightGBM (same as in train.py)
+    # Use categories from featured_df (processed data) to ensure they match training data
+    # This is critical: LightGBM requires exact match of categorical features
+    # Only process columns that were actually categorical in training data
+    for col in features:
+        if col in featured_df.columns and featured_df[col].dtype.name == "category":
+            # Get categories from processed training data
+            train_categories = list(featured_df[col].cat.categories)
+
+            # Convert to string first to handle any type mismatches
+            candidates_final[col] = candidates_final[col].astype(str)
+
+            # Replace any values not in train categories with first train category
+            valid_mask = candidates_final[col].isin([str(cat) for cat in train_categories])
+            if not valid_mask.all():
+                invalid_count = (~valid_mask).sum()
+                print(f"Warning: {invalid_count} values in {col} not in training categories, replacing with first category")
+                candidates_final.loc[~valid_mask, col] = str(train_categories[0]) if len(train_categories) > 0 else "0"
+
+            # Convert categories back to original type and create categorical
+            # Convert train_categories to same type as in training
+            train_cat_values = [str(cat) for cat in train_categories]
+            candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_cat_values, ordered=False)
+
+            # Convert categorical codes back to original type if needed
+            # This ensures the internal representation matches training
+            if len(train_categories) > 0:
+                # Re-map to original category values
+                candidates_final[col] = candidates_final[col].astype(str).map(
+                    {str(cat): cat for cat in train_categories}
+                ).fillna(train_categories[0])
+                candidates_final[col] = pd.Categorical(candidates_final[col], categories=train_categories, ordered=False)
 
     X_test = candidates_final[features]
     print(f"Prediction features: {len(features)}")
@@ -158,9 +247,11 @@ def predict() -> None:
         )
 
     print(f"\nLoading model from {model_path}...")
+    # Load Booster directly - we'll use predict() which returns probabilities for binary classification
     model = lgb.Booster(model_file=str(model_path))
 
     # Generate probabilities
+    # For binary classification, predict() returns probabilities when using booster loaded from file
     print("Generating predictions...")
     test_proba = model.predict(X_test)
 

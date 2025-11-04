@@ -5,6 +5,8 @@ Uses temporal split with absolute date threshold to ensure methodologically
 correct validation without data leakage from future timestamps.
 """
 
+import json
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -148,6 +150,12 @@ def train() -> None:
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
     model.booster_.save_model(str(model_path))
     print(f"\nModel saved to {model_path}")
+
+    # Save feature list for prediction
+    features_path = config.MODEL_DIR / "features_list.json"
+    with open(features_path, "w") as f:
+        json.dump(features, f)
+    print(f"Feature list saved to {features_path}")
 
     print("\nTraining complete.")
 
