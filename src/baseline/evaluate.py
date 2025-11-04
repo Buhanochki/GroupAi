@@ -2,8 +2,8 @@
 Тесты для stage2_evaluate.py - оценка метрик для задачи ранжирования (Stage 2).
 
 Покрывает:
-1. Корректность расчета NDCG@20 и Recall@20
-2. Обработку списков book_id (разделенных пробелами)
+1. Корректность расчета NDCG@20 (Normalized Discounted Cumulative Gain at 20) с трехуровневой релевантностью
+2. Обработку списков book_id (разделенных запятыми)
 3. Дубликаты в списках рекомендаций
 4. Списки разной длины (< 20, = 20, > 20)
 5. Отсутствующие пользователи в submission
@@ -13,15 +13,14 @@
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
 # Добавляем путь к src для импорта
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from metrics.stage2_evaluate import (calculate_stage2_metrics, dcg_at_k, ndcg_at_k, recall_at_k,
-                                     validate_solution_format, validate_submission_format)
+from metrics.stage2_evaluate import (calculate_stage2_metrics, dcg_at_k, ndcg_at_k, validate_solution_format,
+                                     validate_submission_format)
 
 # ============================================================================
 # ФИКСТУРЫ
@@ -51,63 +50,67 @@ class TestMetricFunctions:
         assert dcg_at_k([], k=5) == 0.0
 
     def test_ndcg_perfect(self):
-        """Тест 1.3: NDCG для идеального ранжирования."""
-        y_true = {101, 102, 103}
-        y_pred = [101, 102, 103, 999, 888]  # Первые 3 - все релевантные
-
-        ndcg = ndcg_at_k(y_true, y_pred, k=20)
+        """Тест 1.3: NDCG для идеального ранжирования с трехуровневой релевантностью."""
+        # Идеальный порядок: сначала все двойки, потом единицы, потом нули
+        relevance_scores = [2, 2, 2, 1, 1, 0, 0, 0]
+        ndcg = ndcg_at_k(relevance_scores, k=20)
         assert ndcg == pytest.approx(1.0, abs=1e-6)
 
     def test_ndcg_worst(self):
         """Тест 1.4: NDCG для наихудшего ранжирования."""
-        y_true = {101, 102, 103}
-        y_pred = [999, 888, 777, 666, 555]  # Ни одного релевантного
-
-        ndcg = ndcg_at_k(y_true, y_pred, k=20)
+        # Все релевантности нули (ни одного взаимодействия)
+        relevance_scores = [0, 0, 0, 0, 0]
+        ndcg = ndcg_at_k(relevance_scores, k=20)
         assert ndcg == pytest.approx(0.0, abs=1e-6)
 
-    def test_ndcg_partial(self):
-        """Тест 1.5: NDCG для частичного попадания."""
-        y_true = {101, 102, 103}
-        y_pred = [101, 999, 102, 888, 777]  # 2 из 3 релевантных
+    def test_ndcg_wrong_order(self):
+        """Тест 1.5: NDCG наказывает за неправильный порядок."""
+        # Неправильный порядок: единицы выше двоек
+        relevance_scores = [1, 1, 2, 2, 0, 0]
+        ndcg_wrong = ndcg_at_k(relevance_scores, k=20)
 
-        ndcg = ndcg_at_k(y_true, y_pred, k=20)
-        assert 0.0 < ndcg < 1.0  # Должно быть между 0 и 1
+        # Правильный порядок: двойки выше единиц
+        relevance_scores_ideal = [2, 2, 1, 1, 0, 0]
+        ndcg_ideal = ndcg_at_k(relevance_scores_ideal, k=20)
 
-    def test_recall_perfect(self):
-        """Тест 1.6: Recall для идеального ранжирования."""
-        y_true = {101, 102, 103}
-        y_pred = [101, 102, 103, 999, 888]
+        assert ndcg_ideal == pytest.approx(1.0, abs=1e-6)
+        assert ndcg_wrong < ndcg_ideal  # Неправильный порядок должен давать меньший NDCG
+        assert 0.0 < ndcg_wrong < 1.0
 
-        recall = recall_at_k(y_true, y_pred, k=20)
-        assert recall == pytest.approx(1.0, abs=1e-6)
+    def test_ndcg_three_levels(self):
+        """Тест 1.6: NDCG с трехуровневой релевантностью (2, 1, 0)."""
+        # Идеальный порядок: 2, 2, 1, 1, 0, 0
+        relevance_scores = [2, 2, 1, 1, 0, 0]
+        ndcg = ndcg_at_k(relevance_scores, k=20)
+        assert ndcg == pytest.approx(1.0, abs=1e-6)
 
-    def test_recall_worst(self):
-        """Тест 1.7: Recall для наихудшего ранжирования."""
-        y_true = {101, 102, 103}
-        y_pred = [999, 888, 777, 666, 555]
+    def test_ndcg_reversed_order(self):
+        """Тест 1.7: NDCG наказывает за обратный порядок."""
+        # Обратный порядок: 0, 0, 1, 1, 2, 2 (худший случай)
+        relevance_scores = [0, 0, 1, 1, 2, 2]
+        ndcg = ndcg_at_k(relevance_scores, k=20)
 
-        recall = recall_at_k(y_true, y_pred, k=20)
-        assert recall == pytest.approx(0.0, abs=1e-6)
+        # Идеальный порядок
+        ideal_scores = [2, 2, 1, 1, 0, 0]
+        ideal_ndcg = ndcg_at_k(ideal_scores, k=20)
 
-    def test_recall_partial(self):
-        """Тест 1.8: Recall для частичного попадания."""
-        y_true = {101, 102, 103, 104}  # 4 релевантных
-        y_pred = [101, 999, 102, 888, 777]  # Нашли 2 из 4
+        assert ideal_ndcg == pytest.approx(1.0, abs=1e-6)
+        assert ndcg < ideal_ndcg  # Обратный порядок должен давать меньший NDCG
+        assert 0.0 < ndcg < 1.0
 
-        recall = recall_at_k(y_true, y_pred, k=20)
-        assert recall == pytest.approx(0.5, abs=1e-6)  # 2/4 = 0.5
+    def test_ndcg_mixed_levels(self):
+        """Тест 1.8: NDCG для смешанного порядка."""
+        # Смешанный порядок: 2, 1, 2, 0, 1, 0
+        relevance_scores = [2, 1, 2, 0, 1, 0]
+        ndcg = ndcg_at_k(relevance_scores, k=20)
 
-    def test_recall_with_k_limit(self):
-        """Тест 1.9: Recall с ограничением по k."""
-        y_true = {101, 102, 103}
-        y_pred = [999, 888, 101, 102, 103]  # Релевантные на позициях 3, 4, 5
+        # Идеальный: 2, 2, 1, 1, 0, 0
+        ideal_scores = [2, 2, 1, 1, 0, 0]
+        ideal_ndcg = ndcg_at_k(ideal_scores, k=20)
 
-        recall_5 = recall_at_k(y_true, y_pred, k=5)
-        recall_2 = recall_at_k(y_true, y_pred, k=2)
-
-        assert recall_5 == pytest.approx(1.0, abs=1e-6)  # Все 3 в топ-5
-        assert recall_2 == pytest.approx(0.0, abs=1e-6)  # Ни одного в топ-2
+        assert ideal_ndcg == pytest.approx(1.0, abs=1e-6)
+        assert ndcg < ideal_ndcg
+        assert 0.0 < ndcg < 1.0
 
 
 # ============================================================================
@@ -121,9 +124,8 @@ class TestMetricsCalculation:
         """Тест 2.1: Идеальные рекомендации."""
         metrics = calculate_stage2_metrics(stage2_perfect_submission, stage2_valid_solution)
 
-        # Для идеального случая NDCG и Recall должны быть близки к 1.0
+        # Для идеального случая NDCG@20 должен быть близок к 1.0
         assert metrics['NDCG@20'] == pytest.approx(1.0, abs=0.01)
-        assert metrics['Recall@20'] == pytest.approx(1.0, abs=0.01)
         assert metrics['Score'] == pytest.approx(1.0, abs=0.01)
 
     def test_worst_recommendations(self, stage2_valid_solution, stage2_worst_submission):
@@ -131,16 +133,14 @@ class TestMetricsCalculation:
         metrics = calculate_stage2_metrics(stage2_worst_submission, stage2_valid_solution)
 
         assert metrics['NDCG@20'] == pytest.approx(0.0, abs=1e-6)
-        assert metrics['Recall@20'] == pytest.approx(0.0, abs=1e-6)
         assert metrics['Score'] == pytest.approx(0.0, abs=1e-6)
 
     def test_partial_recommendations(self, stage2_valid_solution, stage2_partial_submission):
         """Тест 2.3: Частичные попадания."""
         metrics = calculate_stage2_metrics(stage2_partial_submission, stage2_valid_solution)
 
-        # Метрики должны быть между 0 и 1
+        # Метрика должна быть между 0 и 1
         assert 0.0 < metrics['NDCG@20'] < 1.0
-        assert 0.0 < metrics['Recall@20'] < 1.0
         assert 0.0 < metrics['Score'] < 1.0
 
     def test_empty_submission(self, stage2_valid_solution):
@@ -151,7 +151,6 @@ class TestMetricsCalculation:
 
         assert metrics['Score'] == 0.0
         assert metrics['NDCG@20'] == 0.0
-        assert metrics['Recall@20'] == 0.0
 
 
 # ============================================================================
@@ -176,8 +175,8 @@ class TestBookIdLists:
         """Тест 3.2: Один единственный book_id в списке."""
         metrics = calculate_stage2_metrics(stage2_single_recommendation_submission, stage2_valid_solution)
 
-        # Recall должен быть низким (1 из многих)
-        assert 0.0 < metrics['Recall@20'] < 0.5
+        # NDCG@20 должен быть низким, если найден только один релевантный элемент из многих
+        assert 0.0 < metrics['NDCG@20'] < 1.0
 
     def test_list_length_less_than_20(self, stage2_valid_solution, stage2_various_lengths_submission):
         """Тест 3.3: Список длиной < 20."""
@@ -223,15 +222,15 @@ class TestDuplicatesInLists:
         metrics = calculate_stage2_metrics(stage2_duplicates_submission, stage2_valid_solution)
         assert 'Score' in metrics
 
-        # При дубликатах Recall может быть ниже ожидаемого
-        assert 0.0 <= metrics['Recall@20'] <= 1.0
+        # При дубликатах NDCG@20 может быть ниже ожидаемого
+        assert 0.0 <= metrics['NDCG@20'] <= 1.0
 
     def test_all_same_book_id(self, stage2_valid_solution, stage2_all_same_book_submission):
         """Тест 4.2: Все рекомендации - один и тот же book_id."""
         metrics = calculate_stage2_metrics(stage2_all_same_book_submission, stage2_valid_solution)
 
-        # Recall и NDCG должны быть очень низкими
-        assert metrics['Recall@20'] < 0.5
+        # NDCG@20 должен быть очень низким
+        assert metrics['NDCG@20'] < 0.5
 
 
 # ============================================================================
@@ -289,7 +288,7 @@ class TestValidation:
 
     def test_empty_solution(self):
         """Тест 6.2: Пустой solution."""
-        empty = pd.DataFrame(columns=['user_id', 'book_id', 'stage'])
+        empty = pd.DataFrame(columns=['user_id', 'book_id_list_read', 'book_id_list_planned', 'stage'])
 
         with pytest.raises(ValueError, match="пуст"):
             validate_solution_format(empty)
@@ -298,8 +297,8 @@ class TestValidation:
         """Тест 6.3: Отсутствие колонок в solution."""
         invalid = pd.DataFrame({
             'user_id': [1, 2],
-            'book_id': [101, 102]
-            # stage отсутствует!
+            'book_id_list_read': ['101', '102']
+            # book_id_list_planned и stage отсутствуют!
         })
 
         with pytest.raises(ValueError, match="отсутствуют необходимые колонки"):
@@ -369,9 +368,10 @@ class TestPublicPrivateSplit:
     def test_different_quality_public_private(self):
         """Тест 7.2: Разное качество для public и private."""
         solution = pd.DataFrame({
-            'user_id': [1, 1, 1, 2, 2, 2],
-            'book_id': [101, 102, 103, 201, 202, 203],
-            'stage': ['public', 'public', 'public', 'private', 'private', 'private']
+            'user_id': [1, 2],
+            'book_id_list_read': ['101,102,103', '201,202,203'],
+            'book_id_list_planned': ['', ''],
+            'stage': ['public', 'private']
         })
 
         # Хорошие рекомендации для user=1 (public), плохие для user=2 (private)
@@ -405,10 +405,11 @@ class TestEdgeCases:
     """Тесты граничных случаев."""
 
     def test_single_user_single_book(self):
-        """Тест 8.1: Один пользователь, одна книга."""
+        """Тест 8.1: Один пользователь, одна прочитанная книга."""
         solution = pd.DataFrame({
             'user_id': [1],
-            'book_id': [101],
+            'book_id_list_read': ['101'],
+            'book_id_list_planned': [''],
             'stage': ['public']
         })
 
@@ -419,32 +420,62 @@ class TestEdgeCases:
 
         metrics = calculate_stage2_metrics(submission, solution)
 
-        # Должно быть идеальным
+        # Должно быть идеальным (релевантность = 2)
         assert metrics['NDCG@20'] == pytest.approx(1.0, abs=1e-6)
-        assert metrics['Recall@20'] == pytest.approx(1.0, abs=1e-6)
+        assert metrics['Score'] == pytest.approx(1.0, abs=1e-6)
 
-    def test_user_with_many_relevant_items(self):
-        """Тест 8.2: Пользователь с большим количеством релевантных книг."""
-        # 25 релевантных книг для одного пользователя
+    def test_three_level_relevance(self):
+        """Тест 8.2: Трехуровневая релевантность - правильный порядок."""
         solution = pd.DataFrame({
-            'user_id': [1] * 25,
-            'book_id': list(range(100, 125)),
-            'stage': ['public'] * 25
+            'user_id': [1],
+            'book_id_list_read': '101,102',  # 2 прочитанные (релевантность = 2)
+            'book_id_list_planned': '103,104',  # 2 запланированные (релевантность = 1)
+            'stage': ['public']
         })
 
-        # Рекомендуем первые 20
-        books_20 = ' '.join(str(i) for i in range(100, 120))
+        # Правильный порядок: прочитанные → запланированные → "холодные"
         submission = pd.DataFrame({
             'user_id': [1],
-            'book_id_list': [books_20]
+            'book_id_list': '101,102,103,104,105,106'  # 105, 106 - "холодные" (релевантность = 0)
         })
 
         metrics = calculate_stage2_metrics(submission, solution)
 
-        # Recall = 20/25 = 0.8
-        assert metrics['Recall@20'] == pytest.approx(0.8, abs=0.01)
+        # Идеальный порядок должен давать NDCG@20 близкий к 1.0
+        assert metrics['NDCG@20'] == pytest.approx(1.0, abs=0.01)
+
+    def test_wrong_order_penalty(self):
+        """Тест 8.3: Штраф за неправильный порядок."""
+        solution = pd.DataFrame({
+            'user_id': [1],
+            'book_id_list_read': '101',  # 1 прочитанная (релевантность = 2)
+            'book_id_list_planned': '102',  # 1 запланированная (релевантность = 1)
+            'stage': ['public']
+        })
+
+        # Неправильный порядок: запланированная выше прочитанной
+        submission_wrong = pd.DataFrame({
+            'user_id': [1],
+            'book_id_list': '102,101'
+        })
+
+        # Правильный порядок: прочитанная выше запланированной
+        submission_right = pd.DataFrame({
+            'user_id': [1],
+            'book_id_list': '101,102'
+        })
+
+        metrics_wrong = calculate_stage2_metrics(submission_wrong, solution)
+        metrics_right = calculate_stage2_metrics(submission_right, solution)
+
+        # Правильный порядок должен давать больший NDCG
+        assert metrics_right['NDCG@20'] > metrics_wrong['NDCG@20']
+        assert metrics_right['NDCG@20'] == pytest.approx(1.0, abs=1e-6)
+
+        assert metrics_right['NDCG@20'] > metrics_wrong['NDCG@20']
+        assert metrics_right['NDCG@20'] == pytest.approx(1.0, abs=1e-6)
 
 
-        # Recall = 20/25 = 0.8
-        assert metrics['Recall@20'] == pytest.approx(0.8, abs=0.01)
+        assert metrics_right['NDCG@20'] > metrics_wrong['NDCG@20']
+        assert metrics_right['NDCG@20'] == pytest.approx(1.0, abs=1e-6)
 
