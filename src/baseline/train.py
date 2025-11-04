@@ -6,6 +6,7 @@ correct validation without data leakage from future timestamps.
 """
 
 import json
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -135,10 +136,25 @@ def train() -> None:
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Create checkpoint directory for intermediate model saves
+    checkpoint_dir = config.MODEL_DIR / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
     # Train model
     print("\nTraining LightGBM model (multiclass classification: 3 classes)...")
     print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
     model = lgb.LGBMClassifier(**config.LGB_PARAMS)
+
+    # Create callback for saving checkpoints every 50 iterations
+    def checkpoint_callback(env: lgb.callback.CallbackEnv) -> None:
+        """Save model checkpoint every 50 iterations."""
+        iteration = env.iteration
+        if iteration > 0 and iteration % 50 == 0:
+            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration}.txt"
+            # env.model is the Booster object during training
+            env.model.save_model(str(checkpoint_path))
+            print(f"  Checkpoint saved at iteration {iteration}: {checkpoint_path}")
 
     # Update fit params with early stopping callback
     fit_params = config.LGB_FIT_PARAMS.copy()
@@ -148,6 +164,7 @@ def train() -> None:
             verbose=True,
         ),
         lgb.log_evaluation(period=1),
+        checkpoint_callback,
     ]
 
     # Explicitly specify categorical features to avoid LightGBM hanging
