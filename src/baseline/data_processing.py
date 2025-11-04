@@ -53,6 +53,13 @@ def load_and_merge_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.
     )
     print(f"Loaded train data: {len(train_df):,} rows (using all records: has_read=0 and has_read=1)")
 
+    # Create relevance target variable for multiclass classification
+    # has_read=1 -> relevance=2 (read books)
+    # has_read=0 -> relevance=1 (planned books)
+    # Note: relevance=0 (cold candidates) will be created later when processing candidates
+    train_df[constants.COL_RELEVANCE] = train_df[constants.COL_HAS_READ].map({1: 2, 0: 1}).astype("int8")
+    print(f"Created relevance target: {train_df[constants.COL_RELEVANCE].value_counts().to_dict()}")
+
     # Load targets.csv
     targets_df = pd.read_csv(
         config.RAW_DATA_DIR / constants.TARGETS_FILENAME,

@@ -15,6 +15,39 @@ from transformers import AutoModel, AutoTokenizer
 from . import config, constants
 
 
+def add_interaction_feature(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds binary interaction feature indicating if (user_id, book_id) pair exists in train data.
+
+    This feature helps distinguish "cold" candidates (relevance=0) from books
+    that user has interacted with in train.csv (relevance=1 or 2).
+
+    Args:
+        df (pd.DataFrame): The main DataFrame to add features to.
+        train_df (pd.DataFrame): The training data containing all user-book interactions.
+
+    Returns:
+        pd.DataFrame: The DataFrame with new interaction feature.
+    """
+    print("Adding interaction feature...")
+
+    # Create set of (user_id, book_id) pairs from train data
+    interaction_pairs = set(
+        zip(train_df[constants.COL_USER_ID], train_df[constants.COL_BOOK_ID], strict=False)
+    )
+
+    # Create feature: 1 if pair exists in train, 0 otherwise
+    df[constants.F_USER_BOOK_INTERACTION] = df.apply(
+        lambda row: 1
+        if (row[constants.COL_USER_ID], row[constants.COL_BOOK_ID]) in interaction_pairs
+        else 0,
+        axis=1,
+    ).astype("int8")
+
+    interaction_count = df[constants.F_USER_BOOK_INTERACTION].sum()
+    print(f"  - Interactions found: {interaction_count:,} / {len(df):,} ({100 * interaction_count / len(df):.1f}%)")
+    return df
+
+
 def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFrame:
     """Calculates and adds user, book, and author aggregate features.
 
@@ -349,8 +382,8 @@ def create_features(
 ) -> pd.DataFrame:
     """Runs the full feature engineering pipeline.
 
-    This function orchestrates the calls to add aggregate features (optional), genre
-    features, text features (TF-IDF and BERT), and handle missing values.
+    This function orchestrates the calls to add interaction feature, aggregate features
+    (optional), genre features, text features (TF-IDF and BERT), and handle missing values.
 
     Args:
         df (pd.DataFrame): The merged DataFrame from `data_processing`.
@@ -364,6 +397,10 @@ def create_features(
     """
     print("Starting feature engineering pipeline...")
     train_df = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
+
+    # Add interaction feature first (must be computed before temporal split)
+    # This feature helps distinguish cold candidates from interacted books
+    df = add_interaction_feature(df, train_df)
 
     # Aggregate features are computed separately during training to ensure
     # no data leakage from validation set timestamps

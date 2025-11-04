@@ -22,7 +22,8 @@ def train() -> None:
 
     Loads prepared data from data/processed/, performs temporal split based on
     absolute date threshold, computes aggregate features on train split only,
-    and trains a single LightGBM model for binary classification (has_read).
+    and trains a single LightGBM model for multiclass classification (relevance).
+    Relevance classes: 0=cold candidates, 1=planned books, 2=read books.
     This ensures methodologically correct validation without data leakage from
     future timestamps.
 
@@ -117,7 +118,8 @@ def train() -> None:
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     # Train model
-    print("\nTraining LightGBM model (binary classification)...")
+    print("\nTraining LightGBM model (multiclass classification: 3 classes)...")
+    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
     model = lgb.LGBMClassifier(**config.LGB_PARAMS)
 
     # Update fit params with early stopping callback
@@ -134,17 +136,26 @@ def train() -> None:
 
     # Evaluate the model
     val_preds = model.predict(X_val)
-    val_proba = model.predict_proba(X_val)[:, 1]
+    val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
 
     accuracy = accuracy_score(y_val, val_preds)
-    precision = precision_score(y_val, val_preds, zero_division=0)
-    recall = recall_score(y_val, val_preds, zero_division=0)
+    # For multiclass, use average='weighted' or 'macro'
+    precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
+    recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
+
+    # Class distribution
+    class_dist = pd.Series(val_preds).value_counts().sort_index()
+    class_proba_mean = val_proba.mean(axis=0)
 
     print(f"\nValidation metrics:")
     print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall: {recall:.4f}")
-    print(f"  Mean predicted probability: {val_proba.mean():.4f}")
+    print(f"  Precision (weighted): {precision:.4f}")
+    print(f"  Recall (weighted): {recall:.4f}")
+    print(f"  Predicted class distribution:")
+    for class_idx in range(3):
+        count = class_dist.get(class_idx, 0)
+        proba_mean = class_proba_mean[class_idx]
+        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
 
     # Save the trained model
     model_path = config.MODEL_DIR / config.MODEL_FILENAME

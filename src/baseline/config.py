@@ -25,7 +25,7 @@ SUBMISSION_DIR = OUTPUT_DIR / "submissions"
 # --- PARAMETERS ---
 N_SPLITS = 5  # Deprecated: kept for backwards compatibility, not used in temporal split
 RANDOM_STATE = 42
-TARGET = constants.COL_TARGET  # Alias for consistency
+TARGET = constants.COL_RELEVANCE  # Multiclass target: 0=cold, 1=planned, 2=read
 
 # --- TEMPORAL SPLIT CONFIG ---
 # Ratio of data to use for training (0 < TEMPORAL_SPLIT_RATIO < 1)
@@ -66,10 +66,12 @@ CAT_FEATURES = [
 ]
 
 # --- MODEL PARAMETERS ---
-# Changed for Stage 2B: binary classification instead of regression
+# Changed for Stage 2B: multiclass classification (3 classes) instead of binary
+# Classes: 0=cold candidates, 1=planned books, 2=read books
 LGB_PARAMS = {
-    "objective": "binary",
-    "metric": "binary_logloss",
+    "objective": "multiclass",
+    "num_class": 3,
+    "metric": "multi_logloss",
     "n_estimators": 2000,
     "learning_rate": 0.01,
     "feature_fraction": 0.8,
@@ -87,7 +89,7 @@ LGB_PARAMS = {
 # LightGBM's fit method allows for a list of callbacks, including early stopping.
 # To use it, we need to specify parameters for the early stopping callback.
 LGB_FIT_PARAMS = {
-    "eval_metric": "binary_logloss",
+    "eval_metric": "multi_logloss",
     "callbacks": [],  # Placeholder for early stopping callback
 }
 

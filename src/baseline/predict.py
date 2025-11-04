@@ -5,6 +5,8 @@ Computes aggregate features on all train data and applies them to test set,
 then generates predictions using the trained model and ranks candidates for each user.
 """
 
+import numpy as np
+
 import lightgbm as lgb
 import pandas as pd
 
@@ -20,9 +22,11 @@ def predict() -> None:
     1. Loads targets.csv and candidates.csv
     2. Expands candidates into (user_id, book_id) pairs
     3. Computes aggregate features on all train data
-    4. Generates probabilities using the trained model
-    5. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
-    6. Saves submission.csv in format: user_id,book_id_list
+    4. Generates probabilities for 3 classes using the trained multiclass model
+       (class 0=cold, 1=planned, 2=read)
+    5. Calculates ranking score: p1*1 + p2*2 (weighted sum based on relevance)
+    6. Ranks candidates for each user and selects top-K (K = min(20, num_candidates))
+    7. Saves submission.csv in format: user_id,book_id_list
 
     Note: Data must be prepared first using prepare_data.py, and model must be trained
     using train.py
@@ -247,13 +251,27 @@ def predict() -> None:
         )
 
     print(f"\nLoading model from {model_path}...")
-    # Load Booster directly - we'll use predict() which returns probabilities for binary classification
+    # Load Booster directly
     model = lgb.Booster(model_file=str(model_path))
 
-    # Generate probabilities
-    # For binary classification, predict() returns probabilities when using booster loaded from file
+    # Generate probabilities for multiclass (3 classes)
+    # For multiclass, Booster.predict() returns probabilities for all classes
+    # Shape: (n_samples, 3) with [p0, p1, p2] for each sample
+    # p0 = probability of class 0 (cold candidates)
+    # p1 = probability of class 1 (planned books)
+    # p2 = probability of class 2 (read books)
     print("Generating predictions...")
-    test_proba = model.predict(X_test)
+    test_proba_all = model.predict(X_test)  # Returns probabilities for all classes
+    # Convert to numpy array if needed and ensure it's 2D array: (n_samples, 3)
+    test_proba_all = np.array(test_proba_all)
+    if test_proba_all.ndim == 1:
+        # If it's 1D, reshape to (n_samples, 3)
+        test_proba_all = test_proba_all.reshape(-1, 3)
+
+    # Calculate ranking score: weighted sum of probabilities
+    # ranking_score = p0*0 + p1*1 + p2*2 = p1 + 2*p2
+    # Higher score = higher relevance (read books > planned books > cold candidates)
+    test_proba = test_proba_all[:, 1] * 1.0 + test_proba_all[:, 2] * 2.0
 
     # Add predictions to candidates dataframe
     candidates_final["prediction"] = test_proba
