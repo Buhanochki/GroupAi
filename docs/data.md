@@ -10,7 +10,7 @@
 
 ### 1.0. Получение данных
 
-Данные расположены по ссылке: [https://drive.google.com/drive/folders/1ioqrB9146B9DLcEVD7V3LIl46IYAyBfm](https://drive.google.com/drive/folders/1ioqrB9146B9DLcEVD7V3LIl46IYAyBfm)
+Данные расположены по ссылке: [https://drive.google.com/drive/folders/17J5ukEc_FH7SzPElsRIrO6rOp3lOE7o7](https://drive.google.com/drive/folders/17J5ukEc_FH7SzPElsRIrO6rOp3lOE7o7)
 
 #### Автоматическая загрузка
 
