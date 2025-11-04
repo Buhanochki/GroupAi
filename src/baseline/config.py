@@ -84,6 +84,9 @@ LGB_PARAMS = {
     "n_jobs": -1,
     "seed": RANDOM_STATE,
     "boosting_type": "gbdt",
+    # Memory optimization parameters to prevent hanging on large datasets
+    "max_bin": 255,  # Reduce from default 255 to use less memory (already optimal)
+    "force_row_wise": True,  # Use row-wise data loading for better memory efficiency with large datasets
 }
 
 # LightGBM's fit method allows for a list of callbacks, including early stopping.

@@ -13,6 +13,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 
 from . import config, constants
+from .evaluate import dcg_at_k, ndcg_at_k
 from .features import add_aggregate_features, handle_missing_values
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
@@ -107,12 +108,29 @@ def train() -> None:
     non_feature_object_cols = train_split_final[features].select_dtypes(include=["object"]).columns.tolist()
     features = [f for f in features if f not in non_feature_object_cols]
 
-    X_train = train_split_final[features]
+    X_train = train_split_final[features].copy()
     y_train = train_split_final[config.TARGET]
-    X_val = val_split_final[features]
+    X_val = val_split_final[features].copy()
     y_val = val_split_final[config.TARGET]
 
+    # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
+    print("Optimizing data types for memory efficiency...")
+    float64_cols = X_train.select_dtypes(include=["float64"]).columns
+    if len(float64_cols) > 0:
+        print(f"  Converting {len(float64_cols)} float64 columns to float32...")
+        X_train[float64_cols] = X_train[float64_cols].astype("float32")
+        X_val[float64_cols] = X_val[float64_cols].astype("float32")
+        print(f"  Memory saved: ~{X_train[float64_cols].memory_usage(deep=True).sum() / 1024**2 / 2:.1f} MB")
+
+    # Identify categorical features for LightGBM
+    categorical_features = [
+        f for f in features if train_split_final[f].dtype.name == "category"
+    ]
+    if categorical_features:
+        print(f"  Categorical features: {len(categorical_features)} ({categorical_features[:5]}...)")
+
     print(f"Training features: {len(features)}")
+    print(f"  Training data shape: {X_train.shape}, Memory: {X_train.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
 
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,7 +142,19 @@ def train() -> None:
 
     # Update fit params with early stopping callback
     fit_params = config.LGB_FIT_PARAMS.copy()
-    fit_params["callbacks"] = [lgb.early_stopping(stopping_rounds=config.EARLY_STOPPING_ROUNDS, verbose=False)]
+    fit_params["callbacks"] = [
+        lgb.early_stopping(
+            stopping_rounds=config.EARLY_STOPPING_ROUNDS,
+            verbose=True,
+        ),
+        lgb.log_evaluation(period=1),
+    ]
+
+    # Explicitly specify categorical features to avoid LightGBM hanging
+    # Convert categorical feature names to column indices
+    categorical_feature_indices = [
+        features.index(f) for f in categorical_features if f in features
+    ]
 
     model.fit(
         X_train,
@@ -132,6 +162,7 @@ def train() -> None:
         eval_set=[(X_val, y_val)],
         eval_metric=fit_params["eval_metric"],
         callbacks=fit_params["callbacks"],
+        categorical_feature=categorical_feature_indices if categorical_feature_indices else "auto",
     )
 
     # Evaluate the model

@@ -378,7 +378,11 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
 
 
 def create_features(
-    df: pd.DataFrame, book_genres_df: pd.DataFrame, descriptions_df: pd.DataFrame, include_aggregates: bool = False
+    df: pd.DataFrame,
+    book_genres_df: pd.DataFrame,
+    descriptions_df: pd.DataFrame,
+    include_aggregates: bool = False,
+    include_bert: bool = True,
 ) -> pd.DataFrame:
     """Runs the full feature engineering pipeline.
 
@@ -391,6 +395,8 @@ def create_features(
         descriptions_df (pd.DataFrame): DataFrame with book descriptions.
         include_aggregates (bool): If True, compute aggregate features. Defaults to False.
             Aggregates are typically computed separately during training to avoid data leakage.
+        include_bert (bool): If True, compute BERT embeddings. Defaults to True.
+            Set to False for faster testing.
 
     Returns:
         pd.DataFrame: The final DataFrame with all features engineered.
@@ -409,7 +415,10 @@ def create_features(
 
     df = add_genre_features(df, book_genres_df)
     df = add_text_features(df, train_df, descriptions_df)
-    df = add_bert_features(df, train_df, descriptions_df)
+    if include_bert:
+        df = add_bert_features(df, train_df, descriptions_df)
+    else:
+        print("BERT features disabled (include_bert=False)")
     df = handle_missing_values(df, train_df)
 
     # Convert categorical columns to pandas 'category' dtype for LightGBM
