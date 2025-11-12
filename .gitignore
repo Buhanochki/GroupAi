@@ -15,7 +15,9 @@ __pycache__/
 
 # Project specific
 data/
+!data/**/.gitkeep
 output/
+!output/**/.gitkeep
 
 # Temporary files
 *.tmp
