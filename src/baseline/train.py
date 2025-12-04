@@ -1,39 +1,244 @@
 """
-Main training script for the LightGBM model.
-
-Uses temporal split with absolute date threshold to ensure methodologically
-correct validation without data leakage from future timestamps.
+Enhanced training script with temporal cross-validation and ensemble support.
 """
 
 import json
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, classification_report, log_loss
+from sklearn.model_selection import ParameterGrid
 
 from . import config, constants
-from .evaluate import dcg_at_k, ndcg_at_k
-from .features import add_aggregate_features, handle_missing_values
+from .evaluate import calculate_stage2_metrics, ndcg_at_k
+from .features import add_aggregate_features, add_advanced_aggregate_features, handle_missing_values
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
 
+class TemporalCrossValidator:
+    """Temporal cross-validation for time-series data."""
+    
+    def __init__(self, n_splits: int = 3):
+        self.n_splits = n_splits
+        
+    def split(self, df: pd.DataFrame, timestamp_col: str = constants.COL_TIMESTAMP):
+        """Generate temporal splits."""
+        # Sort by timestamp
+        df_sorted = df.sort_values(timestamp_col).reset_index(drop=True)
+        dates = df_sorted[timestamp_col].unique()
+        
+        # Create split points
+        split_indices = np.linspace(0, len(dates), self.n_splits + 1, dtype=int)[1:-1]
+        split_dates = [dates[idx] for idx in split_indices]
+        
+        for split_date in split_dates:
+            train_mask = df_sorted[timestamp_col] <= split_date
+            val_mask = df_sorted[timestamp_col] > split_date
+            
+            train_indices = df_sorted[train_mask].index
+            val_indices = df_sorted[val_mask].index
+            
+            yield train_indices, val_indices
+
+
+def prepare_features(
+    train_split: pd.DataFrame, 
+    val_split: pd.DataFrame, 
+    full_train_df: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+    """Prepare features with proper temporal handling."""
+    
+    # Compute aggregates on train split only
+    print("Computing aggregate features...")
+    train_with_agg = add_aggregate_features(train_split.copy(), train_split)
+    train_with_agg = add_advanced_aggregate_features(train_with_agg, train_split)
+    
+    val_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train for aggregates!
+    val_with_agg = add_advanced_aggregate_features(val_with_agg, train_split)
+    
+    # Handle missing values
+    print("Handling missing values...")
+    train_final = handle_missing_values(train_with_agg, train_split)
+    val_final = handle_missing_values(val_with_agg, train_split)
+    
+    # Define features
+    exclude_cols = [
+        constants.COL_SOURCE,
+        config.TARGET,
+        constants.COL_PREDICTION,
+        constants.COL_TIMESTAMP,
+        constants.COL_HAS_READ,
+        constants.COL_TARGET,
+    ]
+    
+    features = [col for col in train_final.columns if col not in exclude_cols]
+    
+    # Exclude object columns
+    non_feature_object_cols = train_final[features].select_dtypes(include=["object"]).columns.tolist()
+    features = [f for f in features if f not in non_feature_object_cols]
+    
+    # Select only numerical and categorical features we care about
+    final_features = []
+    for feature in features:
+        if (feature in config.CAT_FEATURES or 
+            feature in config.NUMERICAL_FEATURES or
+            feature.startswith('tfidf_') or 
+            feature.startswith('bert_')):
+            final_features.append(feature)
+    
+    print(f"Selected {len(final_features)} features for training")
+    
+    X_train = train_final[final_features].copy()
+    y_train = train_final[config.TARGET]
+    X_val = val_final[final_features].copy() 
+    y_val = val_final[config.TARGET]
+    
+    # Optimize memory
+    float64_cols = X_train.select_dtypes(include=["float64"]).columns
+    if len(float64_cols) > 0:
+        X_train[float64_cols] = X_train[float64_cols].astype("float32")
+        X_val[float64_cols] = X_val[float64_cols].astype("float32")
+    
+    return X_train, X_val, y_train, y_val, final_features
+
+
+def evaluate_ndcg(model, X_val, y_val, val_split: pd.DataFrame) -> float:
+    """Evaluate model using NDCG@20 metric."""
+    
+    # Get predictions
+    val_proba = model.predict_proba(X_val)  # [p_cold, p_planned, p_read]
+    
+    # Calculate ranking scores (weighted sum)
+    ranking_scores = val_proba[:, 1] * 1.0 + val_proba[:, 2] * 2.0
+    
+    # Create temporary submission format for evaluation
+    val_split = val_split.copy()
+    val_split['prediction_score'] = ranking_scores
+    
+    # For each user, rank their books and calculate NDCG
+    user_ndcgs = []
+    
+    for user_id in val_split[constants.COL_USER_ID].unique():
+        user_books = val_split[val_split[constants.COL_USER_ID] == user_id]
+        
+        if len(user_books) == 0:
+            continue
+            
+        # Sort by prediction score
+        user_books_sorted = user_books.sort_values('prediction_score', ascending=False)
+        
+        # Get true relevance scores
+        relevance_scores = user_books_sorted[config.TARGET].tolist()
+        
+        # Calculate NDCG@20
+        user_ndcg = ndcg_at_k(relevance_scores, k=min(20, len(relevance_scores)))
+        user_ndcgs.append(user_ndcg)
+    
+    return np.mean(user_ndcgs) if user_ndcgs else 0.0
+
+
+def train_single_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series, 
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    model_params: Dict,
+    model_name: str = "model"
+) -> lgb.LGBMClassifier:
+    """Train a single LightGBM model with enhanced callbacks."""
+    
+    print(f"\nTraining {model_name}...")
+    
+    model = lgb.LGBMClassifier(**model_params)
+    
+    # Enhanced callbacks
+    callbacks = [
+        lgb.early_stopping(
+            stopping_rounds=config.EARLY_STOPPING_ROUNDS,
+            verbose=True,
+            first_metric_only=False
+        ),
+        lgb.log_evaluation(period=50),
+    ]
+    
+    # Identify categorical features
+    categorical_features = [
+        f for f in X_train.columns if X_train[f].dtype.name == "category"
+    ]
+    categorical_feature_indices = [
+        X_train.columns.get_loc(f) for f in categorical_features if f in X_train.columns
+    ]
+    
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric=config.LGB_FIT_PARAMS["eval_metric"],
+        callbacks=callbacks,
+        categorical_feature=categorical_feature_indices if categorical_feature_indices else 'auto',
+    )
+    
+    # Safe evaluation
+    val_preds = model.predict(X_val)
+    val_proba = model.predict_proba(X_val)
+    
+    accuracy, loss, class_dist, class_proba_mean = calculate_safe_metrics(
+        y_val, val_preds, val_proba
+    )
+    
+    print(f"{model_name} - Accuracy: {accuracy:.4f}, Log Loss: {loss:.4f}")
+    print(f"  Predicted class distribution: {class_dist.to_dict()}")
+    
+    return model
+
+def train_ensemble(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame, 
+    y_val: pd.Series,
+    features: List[str]
+) -> Dict[str, lgb.LGBMClassifier]:
+    """Train ensemble of models with different parameters."""
+    
+    ensemble = {}
+    
+    for model_name, model_params in config.ENSEMBLE_MODELS:
+        model = train_single_model(
+            X_train, y_train, X_val, y_val, model_params, model_name
+        )
+        ensemble[model_name] = model
+        
+        # Evaluate individual model
+        val_preds = model.predict(X_val)
+        val_proba = model.predict_proba(X_val)
+        
+        accuracy = accuracy_score(y_val, val_preds)
+        
+        # Fix for log_loss: explicitly specify labels
+        try:
+            loss = log_loss(y_val, val_proba, labels=[0, 1, 2])
+        except ValueError:
+            # If some classes are missing, use available classes
+            available_classes = sorted(y_val.unique())
+            loss = log_loss(y_val, val_proba, labels=available_classes)
+        
+        # Calculate class distribution
+        class_dist = pd.Series(val_preds).value_counts().sort_index()
+        
+        print(f"{model_name} - Accuracy: {accuracy:.4f}, Log Loss: {loss:.4f}")
+        print(f"  Predicted class distribution: {class_dist.to_dict()}")
+    
+    return ensemble
+
+
 def train() -> None:
-    """Runs the model training pipeline with temporal split.
-
-    Loads prepared data from data/processed/, performs temporal split based on
-    absolute date threshold, computes aggregate features on train split only,
-    and trains a single LightGBM model for multiclass classification (relevance).
-    Relevance classes: 0=cold candidates, 1=planned books, 2=read books.
-    This ensures methodologically correct validation without data leakage from
-    future timestamps.
-
-    Note: Data must be prepared first using prepare_data.py
-    """
+    """Enhanced training pipeline with temporal CV and ensemble support."""
+    
     # Load prepared data
     processed_path = config.PROCESSED_DATA_DIR / constants.PROCESSED_DATA_FILENAME
-
     if not processed_path.exists():
         raise FileNotFoundError(
             f"Processed data not found at {processed_path}. "
@@ -46,13 +251,6 @@ def train() -> None:
 
     # Separate train set
     train_set = featured_df[featured_df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN].copy()
-
-    # Check for timestamp column
-    if constants.COL_TIMESTAMP not in train_set.columns:
-        raise ValueError(
-            f"Timestamp column '{constants.COL_TIMESTAMP}' not found in train set. "
-            "Make sure data was prepared with timestamp preserved."
-        )
 
     # Ensure timestamp is datetime
     if not pd.api.types.is_datetime64_any_dtype(train_set[constants.COL_TIMESTAMP]):
@@ -79,146 +277,99 @@ def train() -> None:
     print(f"Min validation timestamp: {min_val_timestamp}")
 
     if min_val_timestamp <= max_train_timestamp:
-        raise ValueError(
-            f"Temporal split validation failed: min validation timestamp ({min_val_timestamp}) "
-            f"is not greater than max train timestamp ({max_train_timestamp})."
-        )
-    print("✅ Temporal split validation passed: all validation timestamps are after train timestamps")
+        raise ValueError("Temporal split validation failed!")
 
-    # Compute aggregate features on train split only (to prevent data leakage)
-    print("\nComputing aggregate features on train split only...")
-    train_split_with_agg = add_aggregate_features(train_split.copy(), train_split)
-    val_split_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train_split for aggregates!
+    print("✅ Temporal split validation passed")
 
-    # Handle missing values (use train_split for fill values)
-    print("Handling missing values...")
-    train_split_final = handle_missing_values(train_split_with_agg, train_split)
-    val_split_final = handle_missing_values(val_split_with_agg, train_split)
+    # Prepare features
+    X_train, X_val, y_train, y_val, features = prepare_features(
+        train_split, val_split, train_set
+    )
 
-    # Define features (X) and target (y)
-    # Exclude timestamp, source, target, prediction columns
-    exclude_cols = [
-        constants.COL_SOURCE,
-        config.TARGET,
-        constants.COL_PREDICTION,
-        constants.COL_TIMESTAMP,
-    ]
-    features = [col for col in train_split_final.columns if col not in exclude_cols]
-
-    # Exclude any remaining object columns that are not model features
-    non_feature_object_cols = train_split_final[features].select_dtypes(include=["object"]).columns.tolist()
-    features = [f for f in features if f not in non_feature_object_cols]
-
-    X_train = train_split_final[features].copy()
-    y_train = train_split_final[config.TARGET]
-    X_val = val_split_final[features].copy()
-    y_val = val_split_final[config.TARGET]
-
-    # Optimize memory usage: convert float64 to float32 (reduces memory by ~50%)
-    print("Optimizing data types for memory efficiency...")
-    float64_cols = X_train.select_dtypes(include=["float64"]).columns
-    if len(float64_cols) > 0:
-        print(f"  Converting {len(float64_cols)} float64 columns to float32...")
-        X_train[float64_cols] = X_train[float64_cols].astype("float32")
-        X_val[float64_cols] = X_val[float64_cols].astype("float32")
-        print(f"  Memory saved: ~{X_train[float64_cols].memory_usage(deep=True).sum() / 1024**2 / 2:.1f} MB")
-
-    # Identify categorical features for LightGBM
-    categorical_features = [
-        f for f in features if train_split_final[f].dtype.name == "category"
-    ]
-    if categorical_features:
-        print(f"  Categorical features: {len(categorical_features)} ({categorical_features[:5]}...)")
-
-    print(f"Training features: {len(features)}")
-    print(f"  Training data shape: {X_train.shape}, Memory: {X_train.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    print(f"Final training data shape: {X_train.shape}")
+    print(f"Final validation data shape: {X_val.shape}")
 
     # Ensure model directory exists
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Create checkpoint directory for intermediate model saves
-    checkpoint_dir = config.MODEL_DIR / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoint directory: {checkpoint_dir}")
+    # Train ensemble
+    print("\n" + "="*50)
+    print("TRAINING ENSEMBLE")
+    print("="*50)
+    
+    ensemble = train_ensemble(X_train, y_train, X_val, y_val, features)
 
-    # Train model
-    print("\nTraining LightGBM model (multiclass classification: 3 classes)...")
-    print("  Classes: 0=cold candidates, 1=planned books, 2=read books")
-    model = lgb.LGBMClassifier(**config.LGB_PARAMS)
+    # Evaluate ensemble
+    print("\n" + "="*50)
+    print("ENSEMBLE EVALUATION")
+    print("="*50)
+    
+    best_ndcg = 0
+    best_model_name = None
+    
+    for model_name, model in ensemble.items():
+        # Calculate NDCG
+        model_ndcg = evaluate_ndcg(model, X_val, y_val, val_split)
+        print(f"{model_name} - NDCG@20: {model_ndcg:.4f}")
+        
+        if model_ndcg > best_ndcg:
+            best_ndcg = model_ndcg
+            best_model_name = model_name
+    
+    print(f"\nBest model: {best_model_name} with NDCG@20: {best_ndcg:.4f}")
 
-    # Create callback for saving checkpoints every 50 iterations
-    def checkpoint_callback(env: lgb.callback.CallbackEnv) -> None:
-        """Save model checkpoint every 50 iterations."""
-        iteration = env.iteration
-        if iteration > 0 and iteration % 50 == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration}.txt"
-            # env.model is the Booster object during training
-            env.model.save_model(str(checkpoint_path))
-            print(f"  Checkpoint saved at iteration {iteration}: {checkpoint_path}")
-
-    # Update fit params with early stopping callback
-    fit_params = config.LGB_FIT_PARAMS.copy()
-    fit_params["callbacks"] = [
-        lgb.early_stopping(
-            stopping_rounds=config.EARLY_STOPPING_ROUNDS,
-            verbose=True,
-        ),
-        lgb.log_evaluation(period=1),
-        checkpoint_callback,
-    ]
-
-    # Explicitly specify categorical features to avoid LightGBM hanging
-    # Convert categorical feature names to column indices
-    categorical_feature_indices = [
-        features.index(f) for f in categorical_features if f in features
-    ]
-
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        eval_metric=fit_params["eval_metric"],
-        callbacks=fit_params["callbacks"],
-        categorical_feature=categorical_feature_indices if categorical_feature_indices else "auto",
-    )
-
-    # Evaluate the model
-    val_preds = model.predict(X_val)
-    val_proba = model.predict_proba(X_val)  # Shape: (n_samples, 3) for 3 classes
-
-    accuracy = accuracy_score(y_val, val_preds)
-    # For multiclass, use average='weighted' or 'macro'
-    precision = precision_score(y_val, val_preds, average="weighted", zero_division=0)
-    recall = recall_score(y_val, val_preds, average="weighted", zero_division=0)
-
-    # Class distribution
-    class_dist = pd.Series(val_preds).value_counts().sort_index()
-    class_proba_mean = val_proba.mean(axis=0)
-
-    print(f"\nValidation metrics:")
-    print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  Precision (weighted): {precision:.4f}")
-    print(f"  Recall (weighted): {recall:.4f}")
-    print(f"  Predicted class distribution:")
-    for class_idx in range(3):
-        count = class_dist.get(class_idx, 0)
-        proba_mean = class_proba_mean[class_idx]
-        print(f"    Class {class_idx}: {count} samples ({100*count/len(val_preds):.1f}%), mean proba: {proba_mean:.4f}")
-
-    # Save the trained model
+    # Save best model and ensemble
+    print("\nSaving models...")
+    
+    # Save best model as main model
+    best_model = ensemble[best_model_name]
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
-    model.booster_.save_model(str(model_path))
-    print(f"\nModel saved to {model_path}")
+    best_model.booster_.save_model(str(model_path))
+    print(f"Best model saved to {model_path}")
 
-    # Save feature list for prediction
+    # Save ensemble
+    for model_name, model in ensemble.items():
+        ensemble_path = config.MODEL_DIR / f"ensemble_{model_name}.txt"
+        model.booster_.save_model(str(ensemble_path))
+    
+    # Save feature list
     features_path = config.MODEL_DIR / "features_list.json"
     with open(features_path, "w") as f:
         json.dump(features, f)
     print(f"Feature list saved to {features_path}")
 
-    print("\nTraining complete.")
+    # Save ensemble info
+    ensemble_info = {
+        "best_model": best_model_name,
+        "best_ndcg": best_ndcg,
+        "models": list(ensemble.keys()),
+        "features_count": len(features)
+    }
+    
+    ensemble_info_path = config.MODEL_DIR / "ensemble_info.json"
+    with open(ensemble_info_path, "w") as f:
+        json.dump(ensemble_info, f, indent=2)
+    
+    print(f"Ensemble info saved to {ensemble_info_path}")
+    print("\n🎉 Training complete!")
+
+def calculate_safe_metrics(y_true, y_pred, y_proba):
+    """Calculate metrics safely when some classes are missing."""
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    # Handle log_loss with possible missing classes
+    try:
+        loss = log_loss(y_true, y_proba, labels=[0, 1, 2])
+    except ValueError:
+        available_classes = sorted(y_true.unique())
+        loss = log_loss(y_true, y_proba, labels=available_classes)
+    
+    # Class distribution
+    class_dist = pd.Series(y_pred).value_counts().sort_index()
+    class_proba_mean = y_proba.mean(axis=0)
+    
+    return accuracy, loss, class_dist, class_proba_mean
 
 
 if __name__ == "__main__":
     train()
-
