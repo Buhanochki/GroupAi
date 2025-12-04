@@ -1,5 +1,5 @@
 """
-Configuration file for the NTO ML competition baseline.
+Enhanced configuration file with optimized parameters for NDCG@20.
 """
 
 from pathlib import Path
@@ -21,37 +21,31 @@ OUTPUT_DIR = ROOT_DIR / "output"
 MODEL_DIR = OUTPUT_DIR / "models"
 SUBMISSION_DIR = OUTPUT_DIR / "submissions"
 
-
 # --- PARAMETERS ---
-N_SPLITS = 5  # Deprecated: kept for backwards compatibility, not used in temporal split
+N_SPLITS = 3  # For temporal cross-validation
 RANDOM_STATE = 42
 TARGET = constants.COL_RELEVANCE  # Multiclass target: 0=cold, 1=planned, 2=read
 
 # --- TEMPORAL SPLIT CONFIG ---
-# Ratio of data to use for training (0 < TEMPORAL_SPLIT_RATIO < 1)
-# 0.8 means 80% of data points (by timestamp) go to train, 20% to validation
 TEMPORAL_SPLIT_RATIO = 0.8
 
 # --- TRAINING CONFIG ---
-EARLY_STOPPING_ROUNDS = 50
-MODEL_FILENAME_PATTERN = "lgb_fold_{fold}.txt"  # Deprecated: kept for backwards compatibility
-MODEL_FILENAME = "lgb_model.txt"  # Single model filename for temporal split
+EARLY_STOPPING_ROUNDS = 100  # Increased for better convergence
+MODEL_FILENAME = "lgb_model.txt"
 
 # --- TF-IDF PARAMETERS ---
-TFIDF_MAX_FEATURES = 500
+TFIDF_MAX_FEATURES = 1000  # Increased for better text representation
 TFIDF_MIN_DF = 2
-TFIDF_MAX_DF = 0.95
-TFIDF_NGRAM_RANGE = (1, 2)
+TFIDF_MAX_DF = 0.9  # Slightly more aggressive
+TFIDF_NGRAM_RANGE = (1, 3)  # Include trigrams
 
 # --- BERT PARAMETERS ---
 BERT_MODEL_NAME = constants.BERT_MODEL_NAME
-BERT_BATCH_SIZE = 8
-BERT_MAX_LENGTH = 512
+BERT_BATCH_SIZE = 16  # Increased for efficiency
+BERT_MAX_LENGTH = 256  # Reduced for faster processing
 BERT_EMBEDDING_DIM = 768
 BERT_DEVICE = "cuda" if torch and torch.cuda.is_available() else "cpu"
-# Limit GPU memory usage to prevent overheating and OOM errors
-BERT_GPU_MEMORY_FRACTION = 0.75
-
+BERT_GPU_MEMORY_FRACTION = 0.8  # Increased for better utilization
 
 # --- FEATURES ---
 CAT_FEATURES = [
@@ -65,34 +59,108 @@ CAT_FEATURES = [
     constants.COL_PUBLISHER,
 ]
 
-# --- MODEL PARAMETERS ---
-# Changed for Stage 2B: multiclass classification (3 classes) instead of binary
-# Classes: 0=cold candidates, 1=planned books, 2=read books
+# New temporal and affinity features
+NUMERICAL_FEATURES = [
+    # User temporal features
+    'user_tenure_days', 'user_total_interactions', 'user_read_ratio',
+    'user_daily_interaction_rate', 'user_conversion_rate', 'user_engagement_score',
+    
+    # Book temporal features  
+    'book_recent_popularity', 'book_historical_popularity', 'book_age_days',
+    'book_popularity_trend', 'book_conversion_rate',
+    
+    # Affinity features
+    'genre_match_score', 'author_interaction_count', 'author_read_ratio',
+    
+    # Existing features
+    constants.F_USER_MEAN_RATING, constants.F_USER_RATINGS_COUNT,
+    constants.F_BOOK_MEAN_RATING, constants.F_BOOK_RATINGS_COUNT,
+    constants.F_AUTHOR_MEAN_RATING, constants.F_BOOK_GENRES_COUNT,
+    constants.COL_AVG_RATING, 'book_genre_diversity'
+]
+
+# --- OPTIMIZED MODEL PARAMETERS ---
+# Optimized for multiclass classification with NDCG focus
 LGB_PARAMS = {
     "objective": "multiclass",
     "num_class": 3,
     "metric": "multi_logloss",
-    "n_estimators": 2000,
-    "learning_rate": 0.01,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 1,
-    "lambda_l1": 0.1,
-    "lambda_l2": 0.1,
-    "num_leaves": 31,
+    "n_estimators": 3000,  # Increased for better performance
+    "learning_rate": 0.01,  # Optimal balance
+    "num_leaves": 255,  # Increased for complex patterns
+    "max_depth": -1,  # Unlimited depth
+    "min_child_samples": 20,
+    "min_child_weight": 0.001,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.1,
+    "min_split_gain": 0.0,
     "verbose": -1,
     "n_jobs": -1,
     "seed": RANDOM_STATE,
     "boosting_type": "gbdt",
-    # Memory optimization parameters to prevent hanging on large datasets
-    "max_bin": 255,  # Reduce from default 255 to use less memory (already optimal)
-    "force_row_wise": True,  # Use row-wise data loading for better memory efficiency with large datasets
+    # Memory optimization
+    "max_bin": 255,
+    "force_row_wise": True,
+    "feature_fraction": 0.9,  # Slightly higher
+    "bagging_fraction": 0.9,  # Slightly higher
+    "bagging_freq": 5,
 }
 
-# LightGBM's fit method allows for a list of callbacks, including early stopping.
-# To use it, we need to specify parameters for the early stopping callback.
+# Alternative parameters for ensemble
+LGB_PARAMS_ALT1 = {
+    "objective": "multiclass",
+    "num_class": 3,
+    "metric": "multi_logloss",
+    "n_estimators": 2000,
+    "learning_rate": 0.05,
+    "num_leaves": 127,
+    "max_depth": 8,
+    "min_child_samples": 30,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.2,
+    "reg_lambda": 0.2,
+    "verbose": -1,
+    "n_jobs": -1,
+    "seed": RANDOM_STATE + 1,  # Different seed for diversity
+}
+
+LGB_PARAMS_ALT2 = {
+    "objective": "multiclass", 
+    "num_class": 3,
+    "metric": "multi_logloss",
+    "n_estimators": 2500,
+    "learning_rate": 0.02,
+    "num_leaves": 191,
+    "max_depth": -1,
+    "min_child_samples": 15,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.05,
+    "reg_lambda": 0.05,
+    "verbose": -1,
+    "n_jobs": -1,
+    "seed": RANDOM_STATE + 2,
+}
+
+# Ensemble configuration
+ENSEMBLE_MODELS = [
+    ("main", LGB_PARAMS),
+    ("alt1", LGB_PARAMS_ALT1), 
+    ("alt2", LGB_PARAMS_ALT2)
+]
+
+# Fit parameters
 LGB_FIT_PARAMS = {
     "eval_metric": "multi_logloss",
-    "callbacks": [],  # Placeholder for early stopping callback
+    "callbacks": [],
 }
 
+# Ranking strategy
+RANKING_STRATEGY = "hierarchical"  # Options: "hierarchical", "two_stage", "direct"
+HIERARCHICAL_MARGINS = {
+    "read_vs_planned": 1.5,    # Minimum gap between read and planned
+    "planned_vs_cold": 1.0,    # Minimum gap between planned and cold
+}
