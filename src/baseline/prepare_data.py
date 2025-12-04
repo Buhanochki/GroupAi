@@ -1,8 +1,5 @@
 """
-Data preparation script that processes raw data and saves it to processed directory.
-
-This script loads raw data, performs feature engineering (without aggregates),
-and saves the processed data to data/processed/ for use in training and prediction.
+Enhanced data preparation script with new features.
 """
 
 from . import config, constants
@@ -11,32 +8,23 @@ from .features import create_features
 
 
 def prepare_data() -> None:
-    """Processes raw data and saves prepared features to processed directory.
-
-    This function:
-    1. Loads raw data from data/raw/
-    2. Uses all records from train.csv (both has_read=0 and has_read=1)
-    3. Applies feature engineering (genres, TF-IDF, BERT) - NO aggregates to avoid data leakage
-    4. Saves processed data to data/processed/processed_features.parquet
-    5. Preserves timestamp for temporal splitting
-
-    Note: Aggregate features are computed separately during training to ensure
-    temporal correctness (no data leakage from validation set).
-
-    The processed data can then be used by train.py and predict.py without
-    re-running the expensive feature engineering steps.
-    """
+    """Enhanced data preparation with temporal and affinity features."""
+    
     print("=" * 60)
-    print("Data Preparation Pipeline")
+    print("Enhanced Data Preparation Pipeline")
     print("=" * 60)
 
     # Load and merge raw data
     merged_df, targets_df, candidates_df, book_genres_df, descriptions_df = load_and_merge_data()
 
-    # Apply feature engineering WITHOUT aggregates
-    # Aggregates will be computed during training on train split only
-    # BERT disabled for faster testing (can be enabled by setting include_bert=True)
-    featured_df = create_features(merged_df, book_genres_df, descriptions_df, include_aggregates=False, include_bert=False)
+    # Apply enhanced feature engineering
+    featured_df = create_features(
+        merged_df, 
+        book_genres_df, 
+        descriptions_df, 
+        include_aggregates=False,  # Aggregates computed during training
+        include_bert=True          # Enable BERT for better performance
+    )
 
     # Ensure processed directory exists
     config.PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,16 +37,26 @@ def prepare_data() -> None:
     featured_df.to_parquet(processed_path, index=False, engine="pyarrow", compression="snappy")
     print("Processed data saved successfully!")
 
-    # Print statistics
+    # Print enhanced statistics
     train_rows = len(featured_df[featured_df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN])
     total_features = len(featured_df.columns)
+    
+    # Count feature types
+    numerical_features = len([col for col in featured_df.columns 
+                            if featured_df[col].dtype in ['int64', 'float64', 'float32', 'int32']])
+    categorical_features = len([col for col in featured_df.columns 
+                               if featured_df[col].dtype.name == 'category'])
+    text_features = len([col for col in featured_df.columns 
+                        if col.startswith('tfidf_') or col.startswith('bert_')])
 
-    print("\nData preparation complete!")
+    print("\nEnhanced data preparation complete!")
     print(f"  - Train rows: {train_rows:,}")
     print(f"  - Total features: {total_features}")
+    print(f"    * Numerical: {numerical_features}")
+    print(f"    * Categorical: {categorical_features}") 
+    print(f"    * Text: {text_features}")
     print(f"  - Output file: {processed_path}")
 
 
 if __name__ == "__main__":
     prepare_data()
-
